@@ -418,7 +418,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
 	alloc->area.SetTo(create_area(
 		"DMA Buffer",
 		&address, B_ANY_KERNEL_ADDRESS, (uint64)page_count * B_PAGE_SIZE,
-		(true || contiguous) ? B_CONTIGUOUS : B_FULL_LOCK,
+		contiguous ? B_CONTIGUOUS : B_FULL_LOCK,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA
 	));
 
