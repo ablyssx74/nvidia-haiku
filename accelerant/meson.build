@@ -41,12 +41,14 @@ executable('ModesetTest',
 	install: false,
 )
 
-executable('ModesetTest2',
-	'ModesetTest2.cpp',
+executable('ModesetTool',
+	'ModesetTool.cpp',
 	dependencies: [
 		dep_be,
-		dep_nvkms_client_cpp,
 	],
 	gnu_symbol_visibility: 'hidden',
-	install: false,
+	install: true,
+	install_dir: 'apps/Nebula',
 )
+
+install_symlink('ModesetTool', pointing_to: '../../../../../apps/Nebula/ModesetTool', install_dir: 'data/deskbar/menu/Applications/Nebula')

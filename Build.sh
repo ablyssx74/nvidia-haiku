@@ -25,6 +25,7 @@ buildProject nvrm_cpp_sdk
 buildProject nvidia_gsp
 buildProject accelerant
 buildProject NvKmsTest
+buildProject VideoStreamsWsi
 buildProject mesa-nvk \
 	-Dpkg_config_path="/boot/data/packages/llvm-project/build-libclc.x86_64/install/share/pkgconfig:/boot/data/packages/SPIRV-LLVM-Translator/build.x86_64/install/lib/pkgconfig:/boot/data/packages/Vulkan/SPIRV-Tools/build.x86_64/install/lib/pkgconfig" \
 	-Dgallium-drivers= \
