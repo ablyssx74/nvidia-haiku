@@ -16,6 +16,8 @@ extern "C" {
 #include "ctrl/ctrl2080/ctrl2080gpu.h" // NV2080_CTRL_CMD_GPU_GET_NAME_STRING
 }
 
+#include "common/edid.h"
+
 
 static inline status_t ToErrorCode(const std::system_error &ex)
 {
@@ -608,6 +610,10 @@ void NvAccelerant::GetEdidInfo(void* info, uint32 size, uint32* _version)
 {
 	debug_printf("NvAccelerant::GetEdidInfo\n");
 
+	if (size < sizeof(struct edid1_info)) {
+		RaiseErrno(B_BUFFER_OVERFLOW);
+	}
+
 	{
 		NvKmsQueryDpyDynamicDataParams params {};
 		params.request.deviceHandle = fKmsDev.Get();
@@ -617,9 +623,8 @@ void NvAccelerant::GetEdidInfo(void* info, uint32 size, uint32* _version)
 		if (!params.reply.edid.valid) {
 			RaiseErrno(B_ERROR);
 		}
-		*_version = 1;
-		memset(info, 0, size);
-		memcpy(info, params.reply.edid.buffer, std::min<size_t>(size, params.reply.edid.bufferSize));
+		edid_decode((edid1_info*)info, (const edid1_raw*)params.reply.edid.buffer);
+		*_version = EDID_VERSION_1;
 	}
 }
 

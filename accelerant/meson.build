@@ -1,4 +1,4 @@
-project('nvidia_gsp', 'cpp',
+project('nvidia_gsp', 'cpp', 'c',
 	default_options: ['cpp_std=c++20']
 )
 
@@ -9,6 +9,7 @@ dep_nvkms_client_cpp = dependency('nvkms-client-cpp')
 
 dep_be = cpp.find_library('be')
 
+subdir('common')
 
 shared_module('nvidia_gsp',
 	'Accelerant.cpp',
@@ -17,6 +18,7 @@ shared_module('nvidia_gsp',
 	dependencies: [
 		dep_nvrm_client_cpp,
 		dep_nvkms_client_cpp,
+		dep_accelerant_common,
 	],
 	name_prefix: '',
 	name_suffix: 'accelerant',
