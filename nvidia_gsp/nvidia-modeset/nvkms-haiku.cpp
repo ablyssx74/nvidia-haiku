@@ -255,7 +255,7 @@ void* nvkms_dec_ref(struct nvkms_ref_ptr *ref_ptr)
 
 // #pragma mark - timer queue
 
-#define NV_TIMER_QUEUE_ENABLED 0
+#define NV_TIMER_QUEUE_ENABLED 1
 
 nvkms_timer_handle_t* nvkms_alloc_timer(nvkms_timer_proc_t *proc, void *dataPtr, NvU32 dataU32, NvU64 usec)
 {

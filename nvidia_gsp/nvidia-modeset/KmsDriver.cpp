@@ -22,11 +22,13 @@ NvHaikuKmsDriver NvHaikuKmsDriver::sInstance;
 
 NvHaikuKmsDriver::~NvHaikuKmsDriver()
 {
-	// TODO: cleanup timer queue
 	if (fIsKmsLoaded) {
 		MutexLocker lock(&fLocker);
 		nvKmsModuleUnload();
 	}
+	// Drain the timer queue without the NVKMS lock held: DoDPC acquires it,
+	// and Fini() waits for in-flight DPCs to complete.
+	fTimerQueue.Fini();
 	if (fNvidiaModule != nullptr) {
 		put_module(NV_HAIKU_MODULE_NAME);
 	}

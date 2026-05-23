@@ -9,17 +9,21 @@ extern "C" {
 #include <util/DoublyLinkedList.h>
 
 
+struct nvkms_timer_t;
+
+
 class NvTimerQueue {
 private:
 	friend struct nvkms_timer_t;
 
-	DPCQueue fDpcQueue;
-
 	class TimerListItem: public DoublyLinkedListLinkImpl<TimerListItem> {};
+
+	DPCQueue fDpcQueue;
 
 	DoublyLinkedList<TimerListItem> fTimerList;
 
 	spinlock fSpinlock = B_SPINLOCK_INITIALIZER;
+	bool fClosing = false;
 
 public:
 	NvTimerQueue();
