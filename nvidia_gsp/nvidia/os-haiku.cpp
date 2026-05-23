@@ -24,6 +24,7 @@ extern "C" {
 
 #include <PCI.h>
 
+#include <heap.h>
 #include <private/kernel/boot_item.h>
 #include <private/kernel/frame_buffer_console.h>
 
@@ -209,7 +210,10 @@ void NV_API_CALL os_free_mem(void *address)
 	if (are_interrupts_enabled()) {
 		free(address);
 	} else {
-		NvHaikuDriver::Instance().IntrSafePool().Free(address);
+		// deferred_free is the kernel's IRQ-safe primitive: it reuses the
+		// freed block as a list node and lets a kernel daemon do the real
+		// free() once it's safe.
+		deferred_free(address);
 	}
 }
 

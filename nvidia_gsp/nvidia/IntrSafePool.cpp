@@ -1,76 +1,36 @@
 #include "IntrSafePool.h"
 
 #include <malloc.h>
-#include <bit>
 
 #include <util/AutoLock.h>
 
 
-template<uint32 maxItemCount>
-void IntrSafePool::Group<maxItemCount>::ReclaimAll(spinlock &lock)
-{
-	while (count > 0) {
-		if (count > maxItemCount) {
-			panic("IntrSafePool: overflowed: %" B_PRIu32 "\n", count);
-		}
-		count--;
-		void *ptr = items[count];
-//		dprintf("IntrSafePool::Reclaim(%p)\n", ptr);
-		items[count] = nullptr;
-		release_spinlock(&lock);
-		enable_interrupts();
-		free(ptr);
-		disable_interrupts();
-		acquire_spinlock(&lock);
-	}
-}
-
-template<uint32 maxItemCount>
-void *IntrSafePool::Group<maxItemCount>::Alloc()
-{
-	if (count == 0) {
-		return nullptr;
-	}
-	count--;
-	void *ptr = items[count];
-	items[count] = nullptr;
-	return ptr;
-}
-
-template<uint32 maxItemCount>
-void IntrSafePool::Group<maxItemCount>::Free(void *ptr)
-{
-	if (count >= maxItemCount) {
-		panic("IntrSafePool: overflow");
-	}
-	items[count] = ptr;
-	count++;
-}
-
 void IntrSafePool::ReclaimAll()
 {
 	InterruptsSpinLocker _(&fSpinlock);
-
-	fReclaimGroup.ReclaimAll(fSpinlock);
 	for (uint32 i = 0; i < kGroupCount; i++) {
 		auto &group = fGroups[i];
-		group.ReclaimAll(fSpinlock);
+		while (group.count > 0) {
+			group.count--;
+			void *ptr = group.items[group.count];
+			group.items[group.count] = nullptr;
+			release_spinlock(&fSpinlock);
+			enable_interrupts();
+			free(ptr);
+			disable_interrupts();
+			acquire_spinlock(&fSpinlock);
+		}
 	}
 }
+
 
 void *IntrSafePool::Alloc(size_t size)
 {
 	SpinLocker _(&fSpinlock);
 
-	fLevel++;
-	ScopeExit se([this] {fLevel--;});
-
+	// Pick the smallest size class that fits; fall through to larger classes
+	// if our preferred class is empty.
 	uint32 n = 0;
-#if 0
-	if (size > kMinSize) {
-		n = std::bit_width(size - 1) - kMinSizePow2;
-	}
-#endif
 	size_t groupSize = kMinSize;
 	while (groupSize < size) {
 		n++;
@@ -78,38 +38,24 @@ void *IntrSafePool::Alloc(size_t size)
 	}
 	for (uint32 i = n; i < kGroupCount; i++) {
 		auto &group = fGroups[i];
-		void *ptr = group.Alloc();
-		if (ptr != nullptr) {
-//			dprintf("IntrSafePool::Alloc(%#" B_PRIxSIZE ":%#" B_PRIxSIZE ", i: %" B_PRIu32 "): %p\n", size, groupSize, i, ptr);
+		if (group.count > 0) {
+			group.count--;
+			void *ptr = group.items[group.count];
+			group.items[group.count] = nullptr;
 			return ptr;
 		}
 	}
-	panic("IntrSafePool: underflow");
+
+	// Pool exhausted (or size > largest class); let the caller propagate
+	// NV_ERR_NO_MEMORY rather than panicking the kernel.
 	return nullptr;
 }
 
-void IntrSafePool::Free(void *ptr)
-{
-	SpinLocker _(&fSpinlock);
-
-	fLevel++;
-	ScopeExit se([this] {fLevel--;});
-
-//	dprintf("IntrSafePool::Free(%p)\n", ptr);
-	fReclaimGroup.Free(ptr);
-}
 
 void IntrSafePool::Maintain()
 {
 	InterruptsSpinLocker _(&fSpinlock);
 
-	int32 oldLevel = fLevel++;
-	ScopeExit se([this] {fLevel--;});
-	if (oldLevel > 0) {
-		return;
-	}
-
-	fReclaimGroup.ReclaimAll(fSpinlock);
 	size_t size = kMinSize;
 	for (uint32 i = 0; i < kGroupCount; i++) {
 		auto &group = fGroups[i];
@@ -119,8 +65,22 @@ void IntrSafePool::Maintain()
 			void *ptr = calloc(1, size);
 			disable_interrupts();
 			acquire_spinlock(&fSpinlock);
+
+			if (ptr == nullptr) {
+				// Out of memory; leave the pool partially refilled and bail.
+				return;
+			}
+			if (group.count >= kGroupMaxItemCount) {
+				// Another CPU refilled this group while we were calling calloc.
+				// Return the excess (outside the spinlock).
+				release_spinlock(&fSpinlock);
+				enable_interrupts();
+				free(ptr);
+				disable_interrupts();
+				acquire_spinlock(&fSpinlock);
+				break;
+			}
 			group.items[group.count] = ptr;
-//			dprintf("IntrSafePool::Reserve(): %p\n", ptr);
 			group.count++;
 		}
 		size *= 2;
