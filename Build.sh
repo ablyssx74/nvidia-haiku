@@ -36,8 +36,16 @@ function buildProject {
 	# a source/ subdirectory.
 	cd "$baseDir/$projectName"
 
+	# nvrm_sdk's meson.build generates two flavors of .pc file: four tied to
+	# a library target (Meson installs those alongside the library, i.e.
+	# develop/lib/pkgconfig, since the libraries themselves install to
+	# develop/lib), but its two standalone pkg.generate(name: 'nvrm', ...)/
+	# 'nvkms' calls (no library target) fall back to Meson's plain
+	# lib/pkgconfig default instead. Both need to be on the search path, or
+	# nvrm_cpp_sdk's dependency('nvrm')/dependency('nvkms') calls fail with
+	# "not found" even though nvrm_sdk built and installed successfully.
 	meson setup "$buildDir" \
-		-Dpkg_config_path="$installDir/develop/lib/pkgconfig" \
+		-Dpkg_config_path="$installDir/develop/lib/pkgconfig:$installDir/lib/pkgconfig" \
 		-Dprefix="$installDir" "$@"
 
 	ninja -C "$buildDir"
