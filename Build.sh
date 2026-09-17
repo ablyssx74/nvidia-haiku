@@ -11,6 +11,22 @@ installDir="$PWD/install.$(getarch)"
 # inside one of them instead.
 git submodule update --init --recursive
 
+# nvrm_sdk's meson.build (lib_nv_kernel / lib_nv_modeset_kernel) links two
+# prebuilt object files straight off disk -- it does not build them itself:
+#   open-gpu-kernel-modules/src/nvidia/_out/Haiku_x86_64/nv-kernel.o
+#   open-gpu-kernel-modules/src/nvidia-modeset/_out/Haiku_x86_64/nv-modeset-kernel.o
+# Those come from NVIDIA's own upstream (plain GNU Make, not meson) build for
+# the "OS agnostic" portion of the driver -- see open-gpu-kernel-modules/
+# Makefile's own nv_kernel_o/nv_modeset_kernel_o rules, which just run
+# `$(MAKE) -C src/nvidia` / `$(MAKE) -C src/nvidia-modeset`. Deliberately NOT
+# running the top-level `make modules` target here: that also pulls in
+# kernel-open/, which builds the actual Linux kbuild kernel module and has
+# no business running on Haiku at all. TARGET_OS defaults to `uname` output
+# (utils.mk), which is "Haiku" when this runs natively here, so no override
+# is needed for the output path to land where meson expects it.
+make -C "$baseDir/open-gpu-kernel-modules/src/nvidia"
+make -C "$baseDir/open-gpu-kernel-modules/src/nvidia-modeset"
+
 function buildProject {
 	projectName="$1"
 	shift
