@@ -12,5 +12,5 @@
 	branch = 570.86.16-haiku
 [submodule "VideoStreamsWsi"]
 	path = VideoStreamsWsi
-	url = https://github.com/X547/VideoStreamsWsi.git
+	url = https://github.com/ablyssx74/VideoStreamsWsi.git
 	branch = hwaccel-nvidia
