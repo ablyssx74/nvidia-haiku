@@ -1,29 +1,153 @@
+diff --git a/src/nouveau/vulkan/nvk_queue.c b/src/nouveau/vulkan/nvk_queue.c
+index bb122086..f8899e42 100644
+--- a/src/nouveau/vulkan/nvk_queue.c
++++ b/src/nouveau/vulkan/nvk_queue.c
+@@ -284,6 +284,32 @@ nvk_queue_submit_exec(struct nvk_queue *queue,
+    }
+ 
+ fail:
++   if (result == VK_ERROR_DEVICE_LOST && getenv("NVK_NVRM_NO_FAULT_DUMP") == NULL) {
++      /* The GPU stopped in this submission. Print the last push buffers of it as plain words (their CPU copies are valid here, and nothing in
++       * this is decoded, so it cannot go wrong on a command it does not know): the one the driver reports as being fetched is among them. */
++      const struct nvk_cmd_push *last[4] = {NULL, NULL, NULL, NULL};
++      unsigned pushes = 0;
++      for (unsigned i = 0; i < submit->command_buffer_count; i++) {
++         struct nvk_cmd_buffer *cmd =
++            container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
++
++         util_dynarray_foreach(&cmd->pushes, struct nvk_cmd_push, push) {
++            if (push->range != 0 && push->map != NULL)
++               last[pushes++ % 4] = push;
++         }
++      }
++      const unsigned shown = pushes < 4 ? pushes : 4;
++      fprintf(stderr, "NVK: the submission that lost the device has %u command buffers and %u pushes; the last %u:\n",
++              submit->command_buffer_count, pushes, shown);
++      for (unsigned k = 0; k < shown; k++) {
++         const struct nvk_cmd_push *push = last[(pushes - shown + k) % 4];
++         const uint32_t *w = (const uint32_t *)push->map;
++         fprintf(stderr, "NVK: push %u of %u: addr %#" PRIx64 ", %u bytes\n", pushes - shown + k + 1, pushes, push->addr, push->range);
++         for (uint32_t d = 0; d < push->range / 4; d++)
++            fprintf(stderr, "NVK: push[%u][%u] = 0x%08x\n", pushes - shown + k + 1, d, w[d]);
++         fflush(stderr);
++      }
++   }
+    if ((sync && result != VK_SUCCESS) ||
+        (pdev->debug_flags & NVK_DEBUG_PUSH_DUMP)) {
+       for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
+index dd7ee5f7..52332605 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
+@@ -1,6 +1,9 @@
+ #include "nvRmApi.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include "c11/threads.h"
+ #include <errno.h>
+ #include <string.h>
+ #ifdef __HAIKU__
+@@ -15,9 +18,26 @@
+ #endif
+ 
+ 
++/* Every call into the resource manager of this process goes through one lock. Many threads allocate, bind and free GPU memory at the same
++ * time (a game's loading threads); the GPU then faulted at an address that was mapped and in use, and the kernel log has the resource manager's
++ * own lock assertions (_rmGpuAllocLockIsOwner). Whether the calls race inside the resource manager is not known: this takes the concurrent
++ * calls of one process out of it. NVK_NVRM_NO_SERIALIZE=1 turns it off. None of these calls waits for the GPU or for another call. */
++static mtx_t nvRmLock;
++static once_flag nvRmLockOnce = ONCE_FLAG_INIT;
++static bool nvRmSerialize;
++
++static void nvRmLockInit(void)
++{
++	mtx_init(&nvRmLock, mtx_plain);
++	nvRmSerialize = getenv("NVK_NVRM_NO_SERIALIZE") == NULL;
++}
++
+ static int nvRmIoctl(int fd, NvU32 cmd, void *pParams, NvU32 paramsSize)
+ {
+ 	int res;
++	call_once(&nvRmLockOnce, nvRmLockInit);
++	if (nvRmSerialize)
++		mtx_lock(&nvRmLock);
+ 	do {
+ #ifdef __HAIKU__
+ 		res = ioctl(fd, cmd + NV_HAIKU_BASE, pParams, paramsSize);
+@@ -28,6 +48,8 @@ static int nvRmIoctl(int fd, NvU32 cmd, void *pParams, NvU32 paramsSize)
+ 			res = errno;
+ 		}
+ 	} while ((res == EINTR || res == EAGAIN));
++	if (nvRmSerialize)
++		mtx_unlock(&nvRmLock);
+ 	return res;
+ }
+ 
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-index bc1c5259..fa90dced 100644
+index bc1c5259..9d2185ea 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-@@ -127,6 +127,7 @@ struct nvkmd_nvrm_exec_ctx {
+@@ -5,6 +5,7 @@
+ #ifndef NVKMD_NVRM_H
+ #define NVKMD_NVRM_H 1
+ 
++#include "c11/threads.h"
+ #include "nvkmd/nvkmd.h"
+ #include "util/vma.h"
+ #include "vk_sync.h"
+@@ -108,6 +109,9 @@ VkResult nvkmd_nvrm_alloc_va(struct nvkmd_dev *dev,
+                                 uint64_t size_B, uint64_t align_B,
+                                 uint64_t fixed_addr, struct nvkmd_va **va_out);
+ 
++/* print the recorded GPU address range events (nvkmd_nvrm_va.c) */
++void nvkmd_nvrm_dump_va_events(void);
++
+ struct nvkmd_nvrm_exec_ctx {
+    struct nvkmd_ctx base;
+    struct nvkmd_mem *notifier;
+@@ -126,7 +130,9 @@ struct nvkmd_nvrm_exec_ctx {
+    } subchannels;
     int osEvent;
     NvHandle hEvent;
++   mtx_t lock;   /* guards everything below: see nvkmd_nvrm_exec_ctx_flush() */
     uint64_t wSeq;
 +   bool lost;   /* the channel failed or timed out: every later flush reports VK_ERROR_DEVICE_LOST */
     uint64_t gpGet;
     uint64_t gpPut;
     struct nv_push push;
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-index ffc3c34e..d58e71ca 100644
+index ffc3c34e..3ab86c5a 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-@@ -12,6 +12,8 @@
+@@ -12,6 +12,9 @@
  #include "vk_log.h"
  
  #include "util/u_memory.h"
 +#include "util/os_time.h"
++#include "c11/threads.h"
 +#include "nverror.h" // ROBUST_CHANNEL_*
  #include "nv_push_clc36f.h"
  
  #include "class/cl0002.h" // NV01_CONTEXT_DMA
-@@ -239,6 +241,35 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+@@ -100,6 +103,7 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
+    ctx->base.ops = &nvkmd_nvrm_exec_ctx_ops;
+    ctx->base.dev = &dev->base;
+ 
++   mtx_init(&ctx->lock, mtx_plain);
+    ctx->osEvent = -1;
+ 
+    VK_CHECK(nvkmd_dev_alloc_mapped_mem(_dev, log_obj,  0x1000,  0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,  &ctx->notifier));
+@@ -225,6 +229,7 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+    if (ctx->notifier != NULL)
+       nvkmd_mem_unref(ctx->notifier);
+ 
++   mtx_destroy(&ctx->lock);
+    FREE(ctx);
+ }
+ 
+@@ -239,8 +244,73 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
     return VK_SUCCESS;
  }
  
@@ -56,10 +180,49 @@ index ffc3c34e..d58e71ca 100644
 +   return (uint64_t)ms * 1000000ull;
 +}
 +
++/* On a GPU fault: find the push buffer segment the GPU was fetching (its GP ring entry holds the GET address) and print the words around the
++ * fetch point (a hex dump, the command that faulted is at or just before it) and the segment's address and length. The decoded form
++ * (vk_push_print) is only printed with NVK_NVRM_FAULT_DECODE=1: it crashed once on a segment, and a failure path must not bring the program
++ * down. NVK_NVRM_NO_FAULT_DUMP=1 turns the whole dump off. Progress is printed as it goes, so a crash shows where. */
++static void
++nvrm_dump_fault_pushbuffer(struct nvkmd_nvrm_exec_ctx *ctx, struct vk_object_base *log_obj, uint64_t get)
++{
++   if (getenv("NVK_NVRM_NO_FAULT_DUMP") != NULL)
++      return;
++
++   struct nvkmd_dev *dev = ctx->base.dev;
++   const uint32_t *ring = (const uint32_t *)ctx->gpFifo->map;
++   fprintf(stderr, "NVK nvrm: fault dump: looking for %#" PRIx64 " among the last GP entries (gpPut %u)\n", get, (unsigned)ctx->gpPut);
++   fflush(stderr);
++
++   for (uint32_t back = 1; back <= 256; back++) {
++      const uint32_t idx = (ctx->gpPut + 0x8000 - back) % 0x8000;
++      const uint32_t e0 = ring[2 * idx], e1 = ring[2 * idx + 1];
++      const uint64_t addr = ((uint64_t)DRF_VAL(A16F, _GP_ENTRY1, _GET_HI, e1) << 32) |
++                            ((uint64_t)DRF_VAL(A16F, _GP_ENTRY0, _GET, e0) << 2);
++      uint32_t len_B = DRF_VAL(A16F, _GP_ENTRY1, _LENGTH, e1) << 2;
++      if (get < addr || get >= addr + len_B)
++         continue;
++
++      fprintf(stderr, "NVK nvrm: fault dump: segment %#" PRIx64 ", %u bytes, GP entry %u back, fetch at dword %u\n",
++              addr, len_B, back, (unsigned)((get - addr) / 4));
++      fflush(stderr);
++
++      nvkmd_nvrm_dump_va_events();
++      /* (the memory behind the address is not looked up here: nvkmd_dev_lookup_mem_by_va() crashed twice on this back end; the submission code
++       * in nvk_queue.c prints the last push buffers instead, and this line says which of them the GPU was in: the one at this address) */
++      return;
++   }
++   fprintf(stderr, "NVK nvrm: fault dump: no push buffer segment among the last 256 GP entries contains %#" PRIx64 "\n", get);
++}
++
  static VkResult
- nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+-nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++nvkmd_nvrm_exec_ctx_flush_locked(struct nvkmd_ctx *_ctx,
                               struct vk_object_base *log_obj)
-@@ -249,7 +280,11 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+ {
+    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
+@@ -249,7 +319,11 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
     struct NvRmApi rm;
     nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
@@ -71,7 +234,7 @@ index ffc3c34e..d58e71ca 100644
     NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
     KeplerBControlGPFifo *userD = ctx->userD->map;
     uint64_t *semAdr = (uint64_t*)ctx->sem->map;
-@@ -271,10 +306,27 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+@@ -271,10 +345,29 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
     volatile NvU32 *doorbell = (void*)((NvU8*)pdev->usermodeMap.address + NVC361_NOTIFY_CHANNEL_PENDING);
     *doorbell = submitTokenNotifier->info32;
  
@@ -94,16 +257,159 @@ index ffc3c34e..d58e71ca 100644
 +                 ctx->wSeq, rSeq, (uint32_t)userD->GPGet, (uint32_t)userD->GPPut,
 +                 (uint32_t)userD->GetHi, (uint32_t)userD->Get, (uint32_t)userD->PutHi, (uint32_t)userD->Put,
 +                 (unsigned)errNotifier->info16, (unsigned)errNotifier->status);
++         if (chanError != 0)
++            nvrm_dump_fault_pushbuffer(ctx, log_obj, ((uint64_t)userD->GetHi << 32) | userD->Get);
 +         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST, "GPU channel %s (error %u %s)",
 +                          chanError != 0 ? "failed" : "timed out", (unsigned)chanError, nvrm_channel_error_name(chanError));
        }
  		struct pollfd pollFds[1] = {
  			{
+@@ -297,6 +390,22 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++/* The context has state that is not safe to share (the sequence number, the push buffer for the semaphore release, the position in the GP
++ * ring). Two threads in a flush at once overwrote each other's release: the GPU ran out of work while a thread waited for a semaphore
++ * value that was never written (Halo Infinite: "GPGet == GPPut" and the semaphore one short, with the same timeout reported twice).
++ * exec and flush therefore hold the context's lock for their whole body. */
++static VkResult
++nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
++                             struct vk_object_base *log_obj)
++{
++   struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
++
++   mtx_lock(&ctx->lock);
++   VkResult result = nvkmd_nvrm_exec_ctx_flush_locked(_ctx, log_obj);
++   mtx_unlock(&ctx->lock);
++   return result;
++}
++
+ static VkResult
+ nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+                             struct vk_object_base *log_obj,
+@@ -305,9 +414,11 @@ nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+ {
+    struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
+ 
++   mtx_lock(&ctx->lock);
+    for (uint32_t i = 0; i < exec_count; i++) {
+       write_gp_fifo_entry(ctx, &execs[i]);
+    }
++   mtx_unlock(&ctx->lock);
+ 
+    return VK_SUCCESS;
+ }
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
-index b4b032c7..0bb06821 100644
+index b4b032c7..dbb1145e 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
-@@ -59,6 +59,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+@@ -4,6 +4,12 @@
+  */
+ 
+ #include "nvkmd_nvrm.h"
++#include "util/u_atomic.h"
++#include "util/os_time.h"
++#include <pthread.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "util/bitscan.h"
+ #include "util/u_memory.h"
+@@ -15,6 +21,92 @@
+ #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
+ 
+ 
++/* A record of the last GPU address range events (allocate, free, bind, unbind), printed when the GPU faults (nvkmd_nvrm_dump_va_events() from
++ * nvkmd_nvrm_ctx.c): a fault is an access to an address that is not mapped, and what happened to that address just before is what tells why. */
++struct nvrm_va_event {
++   uint64_t t_ns;
++   uint64_t addr;
++   uint64_t size;
++   uint32_t what;      /* 1 alloc, 2 free, 3 bind, 4 unbind */
++   uint32_t tid;
++   uint32_t flags;
++   uint32_t handle;
++};
++#define NVRM_VA_EVENTS 16384
++static struct nvrm_va_event nvrm_va_events[NVRM_VA_EVENTS];
++static uint32_t nvrm_va_event_next;
++
++/* Running totals of the ranges backed by system memory (NVKMD_VA_GART, flags bit 3), by size bucket (log2), to see whether they pile up. */
++static int64_t nvrm_gart_live_bytes;
++static int32_t nvrm_gart_live_count;
++static int32_t nvrm_gart_bucket[48];
++static uint64_t nvrm_gart_reported;
++
++static void
++nvrm_gart_report(const char *why)
++{
++   fprintf(stderr, "NVK nvrm: gart live %d ranges, %" PRId64 " MB (%s); live by size:", p_atomic_read(&nvrm_gart_live_count),
++           p_atomic_read(&nvrm_gart_live_bytes) >> 20, why);
++   for (int b = 0; b < 48; b++) {
++      int n = p_atomic_read(&nvrm_gart_bucket[b]);
++      if (n)
++         fprintf(stderr, " 2^%d:%d", b, n);
++   }
++   fprintf(stderr, "\n");
++}
++
++static void
++nvrm_gart_account(uint64_t size, int dir)
++{
++   int b = size ? util_logbase2_64(size) : 0;
++   if (b > 47) b = 47;
++   p_atomic_add(&nvrm_gart_bucket[b], dir);
++   p_atomic_add(&nvrm_gart_live_count, dir);
++   int64_t live = p_atomic_add_return(&nvrm_gart_live_bytes, dir * (int64_t)size);
++   if (dir > 0 && (uint64_t)live >= nvrm_gart_reported + (512ull << 20)) {
++      nvrm_gart_reported = (uint64_t)live;
++      nvrm_gart_report("grew by 512 MB");
++   }
++}
++
++static void
++nvrm_va_event(uint32_t what, uint64_t addr, uint64_t size, uint32_t flags, uint32_t handle)
++{
++   if ((flags & 8) && (what == 1 || what == 2))
++      nvrm_gart_account(size, what == 1 ? 1 : -1);
++   static int log_all = -1;
++   if (log_all < 0)
++      log_all = getenv("NVK_NVRM_VA_LOG") != NULL;
++   if (log_all && (what == 1 || what == 3))
++      fprintf(stderr, "NVK nvrm: va %s %#" PRIx64 " +%#" PRIx64 " flags=%x\n", what == 1 ? "ALLOC" : "BIND", addr, size, flags);
++   uint32_t i = p_atomic_inc_return(&nvrm_va_event_next) - 1;
++   struct nvrm_va_event *e = &nvrm_va_events[i % NVRM_VA_EVENTS];
++   e->t_ns = os_time_get_nano();
++   e->addr = addr;
++   e->size = size;
++   e->what = what;
++   e->tid = (uint32_t)(uintptr_t)pthread_self();
++   e->flags = flags;
++   e->handle = handle;
++}
++
++void
++nvkmd_nvrm_dump_va_events(void)
++{
++   static const char *names[] = {"?", "ALLOC", "FREE", "BIND", "UNBIND"};
++   const uint32_t next = p_atomic_read(&nvrm_va_event_next);
++   const uint32_t count = next < NVRM_VA_EVENTS ? next : NVRM_VA_EVENTS;
++   nvrm_gart_report("at the fault");
++   fprintf(stderr, "NVK nvrm: va events: %u of %u (oldest first)\n", count, next);
++   for (uint32_t k = 0; k < count; k++) {
++      const uint32_t i = next - count + k;
++      const struct nvrm_va_event *e = &nvrm_va_events[i % NVRM_VA_EVENTS];
++      fprintf(stderr, "NVK nvrm: va #%u t=%.6f tid=%x %s %#" PRIx64 " +%#" PRIx64 " flags=%x handle=%#x\n", i, e->t_ns / 1e9, e->tid,
++              names[e->what < 5 ? e->what : 0], e->addr, e->size, e->flags, e->handle);
++   }
++   fflush(stderr);
++}
++
+ VkResult
+ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+                        struct vk_object_base *log_obj,
+@@ -59,6 +151,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
  		.alignment = align_B,
  		.hVASpace = pdev->hVaSpace,
  	};
@@ -115,3 +421,35 @@ index b4b032c7..0bb06821 100644
  	switch (pte_kind) {
  		case 0x1:
  			params.type = NVOS32_TYPE_DEPTH;
+@@ -121,6 +218,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+    }
+    va->hMemoryVirt = hMemoryVirt;
+    va->base.addr = params.offset;
++   nvrm_va_event(1, va->base.addr, va->base.size_B, flags, hMemoryVirt);
+ 
+    *va_out = &va->base;
+ 
+@@ -137,6 +235,7 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
+    struct NvRmApi rm;
+    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+ 
++   nvrm_va_event(2, va->base.addr, va->base.size_B, va->base.flags, va->hMemoryVirt);
+    nvRmApiFree(&rm, va->hMemoryVirt);
+ 
+    FREE(va);
+@@ -173,6 +272,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
+    }
+ 
+    va->hMemoryPhys = mem->hMemoryPhys;
++   nvrm_va_event(3, va->base.addr + va_offset_B, range_B, va->base.flags, mem->hMemoryPhys);
+ 
+    return VK_SUCCESS;
+ }
+@@ -194,6 +294,7 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
+    if (nvRes != NV_OK)
+       return VK_ERROR_UNKNOWN;
+ 
++   nvrm_va_event(4, va->base.addr + va_offset_B, range_B, va->base.flags, 0);
+    va->hMemoryPhys = 0;
+ 
+    return VK_SUCCESS;
