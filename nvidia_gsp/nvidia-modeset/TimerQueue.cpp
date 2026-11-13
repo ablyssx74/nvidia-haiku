@@ -99,7 +99,7 @@ void nvkms_timer_t::DoDPC(class DPCQueue *queue)
 	//  - non-ref-ptr canceled timers: Free() abandoned us; we delete.
 	//  - non-ref-ptr completed timers: caller's eventual Free() deletes us.
 	if (fIsRefPtr || cancel) {
-		delete this;
+		fQueue.DeleteTimer(this);
 	}
 }
 
@@ -108,6 +108,38 @@ void nvkms_timer_t::DoDPC(class DPCQueue *queue)
 
 NvTimerQueue::NvTimerQueue()
 {
+}
+
+nvkms_timer_t *NvTimerQueue::NewTimer(nvkms_timer_proc_t *proc, void *dataPtr, NvU32 dataU32, bool isRefPtr, bool kernelTimer)
+{
+	static_assert(sizeof(nvkms_timer_t) <= kPoolSlotSize, "timer pool slot too small");
+
+	if (are_interrupts_enabled()) {
+		return new(std::nothrow) nvkms_timer_t(*this, proc, dataPtr, dataU32, isRefPtr, kernelTimer);
+	}
+
+	// interrupts are disabled (an interrupt handler, or code that holds a spinlock): no heap
+	InterruptsSpinLocker locker(fSpinlock);
+	for (int i = 0; i < kPoolSlots; i++) {
+		if ((fPoolBusy & (1ULL << i)) == 0) {
+			fPoolBusy |= 1ULL << i;
+			return new(fPool[i]) nvkms_timer_t(*this, proc, dataPtr, dataU32, isRefPtr, kernelTimer);
+		}
+	}
+	return NULL;
+}
+
+void NvTimerQueue::DeleteTimer(nvkms_timer_t *timer)
+{
+	const char *p = (const char*)timer;
+	if (p >= &fPool[0][0] && p < &fPool[kPoolSlots][0]) {
+		int slot = (int)((p - &fPool[0][0]) / kPoolSlotSize);
+		timer->~nvkms_timer_t();
+		InterruptsSpinLocker locker(fSpinlock);
+		fPoolBusy &= ~(1ULL << slot);
+		return;
+	}
+	delete timer;
 }
 
 NvTimerQueue::~NvTimerQueue()
@@ -168,7 +200,7 @@ restart:
 				auto refPtr = static_cast<struct nvkms_ref_ptr*>(timer->fDataPtr);
 				nvkms_dec_ref(refPtr);
 			}
-			delete timer;
+			DeleteTimer(timer);
 			goto restart;
 		}
 	}
@@ -182,7 +214,7 @@ restart:
 
 nvkms_timer_handle_t *NvTimerQueue::Alloc(nvkms_timer_proc_t *proc, void *dataPtr, NvU32 dataU32, NvU64 usec)
 {
-	nvkms_timer_t *timer = new(std::nothrow) nvkms_timer_t(*this, proc, dataPtr, dataU32, false, usec != 0);
+	nvkms_timer_t *timer = NewTimer(proc, dataPtr, dataU32, false, usec != 0);
 	if (timer == NULL) {
 		return NULL;
 	}
@@ -193,7 +225,7 @@ nvkms_timer_handle_t *NvTimerQueue::Alloc(nvkms_timer_proc_t *proc, void *dataPt
 	InterruptsSpinLocker locker(fSpinlock);
 	if (fClosing) {
 		locker.Unlock();
-		delete timer;
+		DeleteTimer(timer);
 		return NULL;
 	}
 
@@ -210,7 +242,7 @@ nvkms_timer_handle_t *NvTimerQueue::Alloc(nvkms_timer_proc_t *proc, void *dataPt
 
 NvBool NvTimerQueue::AllocWithRefPtr(nvkms_timer_proc_t *proc, struct nvkms_ref_ptr *ref_ptr, NvU32 dataU32, NvU64 usec)
 {
-	nvkms_timer_t *timer = new(std::nothrow) nvkms_timer_t(*this, proc, ref_ptr, dataU32, true, usec != 0);
+	nvkms_timer_t *timer = NewTimer(proc, ref_ptr, dataU32, true, usec != 0);
 	if (timer == NULL) {
 		return NV_FALSE;
 	}
@@ -222,7 +254,7 @@ NvBool NvTimerQueue::AllocWithRefPtr(nvkms_timer_proc_t *proc, struct nvkms_ref_
 	if (fClosing) {
 		locker.Unlock();
 		nvkms_dec_ref(ref_ptr);
-		delete timer;
+		DeleteTimer(timer);
 		return NV_FALSE;
 	}
 
@@ -256,6 +288,6 @@ void NvTimerQueue::Free(nvkms_timer_handle_t *handle)
 	}
 
 	if (destroy) {
-		delete handle;
+		handle->fQueue.DeleteTimer(handle);
 	}
 }

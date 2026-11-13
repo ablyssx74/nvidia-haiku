@@ -2,6 +2,11 @@
 
 #include <vector>
 
+#include <FindDirectory.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 #include <ErrorUtils.h>
 #include <NvRmApi.h>
 #include <NvRmDevice.h>
@@ -119,6 +124,23 @@ private:
 	NvKmsDpyAttributeDpmsValue fDpmsState = NV_KMS_DPY_ATTRIBUTE_DPMS_ON;
 	NvKmsBitmap fOldFramebuffer, fFramebuffer;
 
+	// VBlank Semaphore Control: while enabled, nvkms writes the current vblank count into fVblankData on every vblank. A thread
+	// watches it and releases fRetraceSem (the accelerant's retrace semaphore, what BScreen::WaitForRetrace() waits on).
+	NvKmsBitmap fVblankData;
+	NvKmsVblankSemControlHandle fVblankSemControl {};
+	bool fVblankSemControlEnabled = false;
+	sem_id fRetraceSem = -1;
+	thread_id fRetraceThread = -1;
+	volatile bool fRetraceStop = false;
+	char fVblankPendingPath[B_PATH_NAME_LENGTH] = {};   // the crash guard's marker file, while it exists
+	void RemoveVblankPendingMarker();
+	void EnableVblankSemControl();
+	void DisableVblankSemControl();
+	void StartRetrace();
+	void StopRetrace();
+	void RetraceLoop();
+	static status_t RetraceThreadEntry(void *arg);
+
 	NvKmsBitmap fCursor, fNewCursor;
 	struct {
 		int32 x;
@@ -135,6 +157,10 @@ private:
 
 public:
 	static NvAccelerant *Instance() {return sInstance;}
+
+	~NvAccelerant();
+
+	sem_id RetraceSemaphore() const {return fRetraceSem;}
 
 	static void Init(int fd);
 	static void Clone(void* data);
@@ -256,11 +282,191 @@ bool NvAccelerant::ValidateMode(const NvKmsMode &mode)
 	return params.reply.valid;
 }
 
+NvAccelerant::~NvAccelerant()
+{
+	StopRetrace();
+}
+
+void NvAccelerant::EnableVblankSemControl()
+{
+	if (fVblankSemControlEnabled) {
+		return;
+	}
+	if (!fVblankData.IsSet()) {
+		// 64x16 pixels of 4 bytes with a pitch of 256: 4096 bytes, far more than sizeof(NvKmsVblankSemControlData)
+		fVblankData = NvKmsBitmap(fRmDev, fKmsDev, 64, 16, B_RGBA32);
+	}
+	memset(fVblankData.Bits(), 0, fVblankData.BitsLength());
+
+	NvKmsEnableVblankSemControlParams params {};
+	params.request.deviceHandle = fKmsDev.Get();
+	params.request.dispHandle = fDisp;
+	params.request.headMask = 1U << fHead;
+	params.request.surfaceHandle = fVblankData.Surface().Get();
+	params.request.surfaceOffset = 0;
+	CheckErrno(fKms.Control(NVKMS_IOCTL_ENABLE_VBLANK_SEM_CONTROL, &params, sizeof(params)));
+	fVblankSemControl = params.reply.vblankSemControlHandle;
+	fVblankSemControlEnabled = true;
+}
+
+void NvAccelerant::DisableVblankSemControl()
+{
+	if (!fVblankSemControlEnabled) {
+		return;
+	}
+	fVblankSemControlEnabled = false;
+
+	NvKmsDisableVblankSemControlParams params {};
+	params.request.deviceHandle = fKmsDev.Get();
+	params.request.dispHandle = fDisp;
+	params.request.vblankSemControlHandle = fVblankSemControl;
+	try {
+		CheckErrno(fKms.Control(NVKMS_IOCTL_DISABLE_VBLANK_SEM_CONTROL, &params, sizeof(params)));
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_gsp: disabling vblank sem control: %s\n", ex.what());
+	}
+}
+
+void NvAccelerant::RemoveVblankPendingMarker()
+{
+	if (fVblankPendingPath[0] != '\0') {
+		unlink(fVblankPendingPath);
+		sync();
+		fVblankPendingPath[0] = '\0';
+	}
+}
+
+status_t NvAccelerant::RetraceThreadEntry(void *arg)
+{
+	((NvAccelerant*)arg)->RetraceLoop();
+	return B_OK;
+}
+
+void NvAccelerant::RetraceLoop()
+{
+	const volatile NvKmsVblankSemControlData *data = (const volatile NvKmsVblankSemControlData*)fVblankData.Bits();
+	NvU64 last = data->head[fHead].vblankCount;
+	NvU64 first = last;
+	bigtime_t firstTime = system_time();
+	bool reported = false;
+
+	while (!fRetraceStop) {
+		NvU64 count = data->head[fHead].vblankCount;
+		if (count != last) {
+			last = count;
+			int32 waiting = 0;
+			if (get_sem_count(fRetraceSem, &waiting) == B_OK && waiting < 1) {
+				release_sem_etc(fRetraceSem, 1, B_DO_NOT_RESCHEDULE);
+			}
+			if (fVblankPendingPath[0] != '\0' && last - first >= 1200) {
+				// about 20 seconds of normal retrace: the guard has done its job
+				RemoveVblankPendingMarker();
+				debug_printf("nvidia_gsp: retrace has been running normally for a while, guard file removed\n");
+			}
+			if (!reported && last - first >= 240) {
+				// once: what refresh rate the vblank count shows (the kernel log is the only place to see it)
+				bigtime_t elapsed = system_time() - firstTime;
+				debug_printf("nvidia_gsp: retrace: %" B_PRIu64 " vblanks in %" B_PRId64 " us (%.2f Hz)\n",
+					(uint64)(last - first), (int64)elapsed, (last - first) * 1000000.0 / elapsed);
+				reported = true;
+			}
+		}
+		snooze(250);
+	}
+}
+
+void NvAccelerant::StartRetrace()
+{
+	// Retrace (vblank) is on by default, with a crash guard: a marker file is written (and the disk synced) before vblank is
+	// enabled and removed after the retrace thread has run normally for a while. If the marker is still there at the next start,
+	// the last attempt did not finish (a kernel panic, say), so vblank stays off from then on (nvidia_gsp_no_vblank is created;
+	// delete it to try again) instead of repeating the failure on every boot. Creating nvidia_gsp_no_vblank by hand turns it off.
+	{
+		char dir[B_PATH_NAME_LENGTH], noPath[B_PATH_NAME_LENGTH];
+		struct stat st;
+		if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, false, dir, sizeof(dir)) != B_OK) {
+			debug_printf("nvidia_gsp: retrace off (no settings directory)\n");
+			return;
+		}
+		snprintf(noPath, sizeof(noPath), "%s/nvidia_gsp_no_vblank", dir);
+		snprintf(fVblankPendingPath, sizeof(fVblankPendingPath), "%s/nvidia_gsp_vblank_pending", dir);
+		if (stat(noPath, &st) == 0) {
+			debug_printf("nvidia_gsp: retrace off (%s exists)\n", noPath);
+			fVblankPendingPath[0] = '\0';
+			return;
+		}
+		if (stat(fVblankPendingPath, &st) == 0) {
+			debug_printf("nvidia_gsp: the last start with vblank did not finish: retrace stays off (delete %s to try again)\n",
+				noPath);
+			int fd = open(noPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd >= 0) {
+				const char note[] = "vblank was turned off because the last start with it did not finish; delete this file to try again\n";
+				write(fd, note, sizeof(note) - 1);
+				close(fd);
+			}
+			unlink(fVblankPendingPath);
+			sync();
+			fVblankPendingPath[0] = '\0';
+			return;
+		}
+		int fd = open(fVblankPendingPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0) {
+			debug_printf("nvidia_gsp: retrace off (cannot write the guard file)\n");
+			fVblankPendingPath[0] = '\0';
+			return;
+		}
+		close(fd);
+		sync();
+	}
+
+	try {
+		EnableVblankSemControl();
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_gsp: no vblank (retrace semaphore not offered): %s\n", ex.what());
+		RemoveVblankPendingMarker();
+		return;
+	}
+	fRetraceSem = create_sem(0, "nvidia_gsp retrace");
+	if (fRetraceSem < 0) {
+		DisableVblankSemControl();
+		RemoveVblankPendingMarker();
+		return;
+	}
+	fRetraceStop = false;
+	fRetraceThread = spawn_thread(RetraceThreadEntry, "nvidia_gsp retrace", B_REAL_TIME_DISPLAY_PRIORITY, this);
+	if (fRetraceThread < 0) {
+		delete_sem(fRetraceSem);
+		fRetraceSem = -1;
+		DisableVblankSemControl();
+		RemoveVblankPendingMarker();
+		return;
+	}
+	resume_thread(fRetraceThread);
+	debug_printf("nvidia_gsp: retrace semaphore %" B_PRId32 " enabled\n", fRetraceSem);
+}
+
+void NvAccelerant::StopRetrace()
+{
+	if (fRetraceThread >= 0) {
+		fRetraceStop = true;
+		status_t result;
+		wait_for_thread(fRetraceThread, &result);
+		fRetraceThread = -1;
+	}
+	if (fRetraceSem >= 0) {
+		delete_sem(fRetraceSem);
+		fRetraceSem = -1;
+	}
+	DisableVblankSemControl();
+}
+
 void NvAccelerant::Init(int fd)
 {
 	debug_printf("NvAccelerant::Init\n");
 
 	sInstance = new NvAccelerant(fd);
+	// only the accelerant that app_server initialises serves retrace; clones (Clone()) do not
+	sInstance->StartRetrace();
 }
 
 static const char kCloneInfo[] = "/dev/graphics/nvidia0"; // FIXME
@@ -456,6 +662,9 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 
 	NvKmsBitmap newFramebuffer(fRmDev, fKmsDev, modeToSet->virtual_width, modeToSet->virtual_height, (color_space)modeToSet->space);
 
+	// the head is shut down and brought up again: the vblank sem control has to be enabled again afterwards
+	DisableVblankSemControl();
+
 	{
 		NvKmsSetModeParams params {};
 		params.request.deviceHandle = fKmsDev.Get();
@@ -488,6 +697,14 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 
 	fOldFramebuffer = std::move(fFramebuffer);
 	fFramebuffer = std::move(newFramebuffer);
+
+	if (fRetraceSem >= 0) {
+		try {
+			EnableVblankSemControl();
+		} catch (const std::system_error &ex) {
+			debug_printf("[!] nvidia_gsp: vblank not available after the mode change: %s\n", ex.what());
+		}
+	}
 }
 
 void NvAccelerant::GetDisplayMode(display_mode* currentMode)
@@ -947,6 +1164,13 @@ _EXPORT void *get_accelerant_hook(uint32 feature, void *data)
 			return (void*)fn;
 		}
 #endif
+		case B_ACCELERANT_RETRACE_SEMAPHORE: {
+			accelerant_retrace_semaphore fn = []() -> sem_id {
+				NvAccelerant *acc = NvAccelerant::Instance();
+				return acc != nullptr ? acc->RetraceSemaphore() : -1;
+			};
+			return (void*)fn;
+		}
 		case B_GET_EDID_INFO: {
 			get_edid_info fn = [](void* info, uint32 size, uint32* _version) {
 				try {

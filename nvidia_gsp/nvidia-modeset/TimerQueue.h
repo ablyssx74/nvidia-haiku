@@ -25,6 +25,17 @@ private:
 	spinlock fSpinlock = B_SPINLOCK_INITIALIZER;
 	bool fClosing = false;
 
+	// Timers can be allocated from an interrupt handler (nvkms asks for a timer with a delay of 0 from its vblank callback, to
+	// move the work out of the interrupt). The heap takes a mutex, which must not be done with interrupts disabled, so such
+	// timers come from a pool of preallocated slots. Both are guarded by fSpinlock.
+	static const int kPoolSlots = 64;
+	static const size_t kPoolSlotSize = 256;
+	alignas(16) char fPool[kPoolSlots][kPoolSlotSize];
+	uint64 fPoolBusy = 0;
+
+	nvkms_timer_t *NewTimer(nvkms_timer_proc_t *proc, void *dataPtr, NvU32 dataU32, bool isRefPtr, bool kernelTimer);
+	void DeleteTimer(nvkms_timer_t *timer);
+
 public:
 	NvTimerQueue();
 	~NvTimerQueue();

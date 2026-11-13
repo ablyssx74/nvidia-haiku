@@ -1,0 +1,117 @@
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+index bc1c5259..fa90dced 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+@@ -127,6 +127,7 @@ struct nvkmd_nvrm_exec_ctx {
+    int osEvent;
+    NvHandle hEvent;
+    uint64_t wSeq;
++   bool lost;   /* the channel failed or timed out: every later flush reports VK_ERROR_DEVICE_LOST */
+    uint64_t gpGet;
+    uint64_t gpPut;
+    struct nv_push push;
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+index ffc3c34e..d58e71ca 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+@@ -12,6 +12,8 @@
+ #include "vk_log.h"
+ 
+ #include "util/u_memory.h"
++#include "util/os_time.h"
++#include "nverror.h" // ROBUST_CHANNEL_*
+ #include "nv_push_clc36f.h"
+ 
+ #include "class/cl0002.h" // NV01_CONTEXT_DMA
+@@ -239,6 +241,35 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+    return VK_SUCCESS;
+ }
+ 
++
++/* Haiku: the channel's error notifier is filled in by the resource manager when the GPU channel dies (an MMU fault, a hung engine,
++ * ...). The flush used to poll for ever for the semaphore of a channel that can never write it again, so a program that
++ * triggered a GPU fault hung inside vkQueueSubmit() (and could take the machine with it when it was closed). Look at the
++ * notifier on every round, give up after NVK_NVRM_TIMEOUT_MS (default 30 s, 0 = never) and report VK_ERROR_DEVICE_LOST. */
++static const char *
++nvrm_channel_error_name(uint32_t code)
++{
++   switch (code) {
++   case ROBUST_CHANNEL_GR_EXCEPTION: return "GR_EXCEPTION";
++   case ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT: return "MMU_FAULT";
++   case ROBUST_CHANNEL_PBDMA_ERROR: return "PBDMA_ERROR";
++   case ROBUST_CHANNEL_PREEMPTIVE_REMOVAL: return "PREEMPTIVE_REMOVAL";
++   default: return "unknown";
++   }
++}
++
++static uint64_t
++nvrm_gpu_timeout_ns(void)
++{
++   static int64_t ms = -1;
++   if (ms < 0) {
++      const char *e = getenv("NVK_NVRM_TIMEOUT_MS");
++      ms = e ? atoll(e) : 30000;
++      if (ms < 0) ms = 30000;
++   }
++   return (uint64_t)ms * 1000000ull;
++}
++
+ static VkResult
+ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+                              struct vk_object_base *log_obj)
+@@ -249,7 +280,11 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    struct NvRmApi rm;
+    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+ 
++   if (ctx->lost)
++      return vk_error(log_obj, VK_ERROR_DEVICE_LOST);
++
+    NvNotification *notifiers = ctx->notifier->map;
++   NvNotification *errNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR];
+    NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
+    KeplerBControlGPFifo *userD = ctx->userD->map;
+    uint64_t *semAdr = (uint64_t*)ctx->sem->map;
+@@ -271,10 +306,27 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    volatile NvU32 *doorbell = (void*)((NvU8*)pdev->usermodeMap.address + NVC361_NOTIFY_CHANNEL_PENDING);
+    *doorbell = submitTokenNotifier->info32;
+ 
++   const uint64_t start_ns = os_time_get_nano();
++   const uint64_t timeout_ns = nvrm_gpu_timeout_ns();
+    for (;;) {
+       uint64_t rSeq = *semAdr;
+       if (rSeq == ctx->wSeq) {
+          break;
++      }
++      /* a healthy channel has a value in info32 too (8 was seen); an error also sets status (0xffff in an MMU fault) */
++      NvU32 chanError = errNotifier->status != 0 ? errNotifier->info32 : 0;
++      bool timedOut = timeout_ns != 0 && os_time_get_nano() - start_ns > timeout_ns;
++      if (chanError != 0 || timedOut) {
++         ctx->lost = true;
++         fprintf(stderr, "NVK nvrm: GPU channel %s (error %u %s) waiting for submission %" PRIu64 " (semaphore at %" PRIu64
++                 "), GPGet %" PRIu32 " GPPut %" PRIu32 " PB get %#" PRIx32 "%08" PRIx32 " put %#" PRIx32 "%08" PRIx32 ", error notifier "
++                 "info16 %u status %#x\n",
++                 chanError != 0 ? "failed" : "timed out", (unsigned)chanError, nvrm_channel_error_name(chanError),
++                 ctx->wSeq, rSeq, (uint32_t)userD->GPGet, (uint32_t)userD->GPPut,
++                 (uint32_t)userD->GetHi, (uint32_t)userD->Get, (uint32_t)userD->PutHi, (uint32_t)userD->Put,
++                 (unsigned)errNotifier->info16, (unsigned)errNotifier->status);
++         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST, "GPU channel %s (error %u %s)",
++                          chanError != 0 ? "failed" : "timed out", (unsigned)chanError, nvrm_channel_error_name(chanError));
+       }
+ 		struct pollfd pollFds[1] = {
+ 			{
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
+index b4b032c7..0bb06821 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
+@@ -59,6 +59,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+ 		.alignment = align_B,
+ 		.hVASpace = pdev->hVaSpace,
+ 	};
++	/* A sparse range (sparse buffers and images: D3D12 reserved/tiled resources) must not fault where nothing is bound but read
++	 * zeros and drop writes. The resource manager has a flag for exactly that; without it every access to an unbound tile (the
++	 * copy engine writing the first mips of a reserved texture, for one) is a GPU memory fault that kills the channel. */
++	if (flags & NVKMD_VA_SPARSE)
++		params.flags |= NVOS32_ALLOC_FLAGS_SPARSE;
+ 	switch (pte_kind) {
+ 		case 0x1:
+ 			params.type = NVOS32_TYPE_DEPTH;

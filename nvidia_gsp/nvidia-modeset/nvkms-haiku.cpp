@@ -56,7 +56,9 @@ NvBool nvkms_hdmi_deepcolor(void)
 
 NvBool nvkms_vblank_sem_control(void)
 {
-	return NV_FALSE;
+	// VBlank Semaphore Control: while a client has it enabled, nvkms writes the current vblank count into the client's
+	// memory on every vblank. The accelerant uses that for its retrace semaphore (BScreen::WaitForRetrace()).
+	return NV_TRUE;
 }
 
 NvBool nvkms_opportunistic_display_sync(void)
