@@ -300,7 +300,7 @@ index ffc3c34e..3ab86c5a 100644
     return VK_SUCCESS;
  }
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
-index b4b032c7..dbb1145e 100644
+index b4b032c7..f8a899a4 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 @@ -4,6 +4,12 @@
@@ -316,7 +316,7 @@ index b4b032c7..dbb1145e 100644
  
  #include "util/bitscan.h"
  #include "util/u_memory.h"
-@@ -15,6 +21,92 @@
+@@ -15,6 +21,95 @@
  #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
  
  
@@ -362,7 +362,10 @@ index b4b032c7..dbb1145e 100644
 +   p_atomic_add(&nvrm_gart_bucket[b], dir);
 +   p_atomic_add(&nvrm_gart_live_count, dir);
 +   int64_t live = p_atomic_add_return(&nvrm_gart_live_bytes, dir * (int64_t)size);
-+   if (dir > 0 && (uint64_t)live >= nvrm_gart_reported + (512ull << 20)) {
++   static int report_growth = -1;
++   if (report_growth < 0)
++      report_growth = getenv("NVK_NVRM_VA_LOG") != NULL;
++   if (report_growth && dir > 0 && (uint64_t)live >= nvrm_gart_reported + (512ull << 20)) {
 +      nvrm_gart_reported = (uint64_t)live;
 +      nvrm_gart_report("grew by 512 MB");
 +   }
@@ -409,7 +412,7 @@ index b4b032c7..dbb1145e 100644
  VkResult
  nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
                         struct vk_object_base *log_obj,
-@@ -59,6 +151,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+@@ -59,6 +154,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
  		.alignment = align_B,
  		.hVASpace = pdev->hVaSpace,
  	};
@@ -421,7 +424,7 @@ index b4b032c7..dbb1145e 100644
  	switch (pte_kind) {
  		case 0x1:
  			params.type = NVOS32_TYPE_DEPTH;
-@@ -121,6 +218,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+@@ -121,6 +221,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
     }
     va->hMemoryVirt = hMemoryVirt;
     va->base.addr = params.offset;
@@ -429,7 +432,7 @@ index b4b032c7..dbb1145e 100644
  
     *va_out = &va->base;
  
-@@ -137,6 +235,7 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
+@@ -137,6 +238,7 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
     struct NvRmApi rm;
     nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
@@ -437,7 +440,7 @@ index b4b032c7..dbb1145e 100644
     nvRmApiFree(&rm, va->hMemoryVirt);
  
     FREE(va);
-@@ -173,6 +272,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
+@@ -173,6 +275,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
     }
  
     va->hMemoryPhys = mem->hMemoryPhys;
@@ -445,7 +448,7 @@ index b4b032c7..dbb1145e 100644
  
     return VK_SUCCESS;
  }
-@@ -194,6 +294,7 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
+@@ -194,6 +297,7 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
     if (nvRes != NV_OK)
        return VK_ERROR_UNKNOWN;
  
