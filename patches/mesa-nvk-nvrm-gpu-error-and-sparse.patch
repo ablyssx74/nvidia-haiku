@@ -299,6 +299,125 @@ index ffc3c34e..3ab86c5a 100644
  
     return VK_SUCCESS;
  }
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+index 9af48be4..af096056 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+@@ -13,6 +13,46 @@
+ #include "class/cl003e.h" // NV01_MEMORY_SYSTEM
+ #include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER
+ 
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++
++
++/* Haiku has no dma-buf: a file descriptor cannot carry a GPU memory object to another place. Wine's shared Direct3D resources (DXVK, which Unity
++ * uses for the interop with NVIDIA's DLSS plug-in, among others) need it anyway: win32u allocates the memory, asks for a file descriptor
++ * with vkGetMemoryFdKHR() at once and keeps it in the wineserver for whoever opens the resource, and every vkAllocateMemory() of such a
++ * resource failed because the export was not there (Frontline 1942 crashed in DXVK on its first allocation). The descriptor is a fresh,
++ * unlinked file: only its identity (device and inode) matters. This process remembers which memory object each one stands for, so that an
++ * import of the descriptor in the same process (the game opening its own shared resource, the usual case) gives back that memory. An import
++ * in another process is refused as before. */
++struct nvrm_export_entry {
++   struct nvrm_export_entry *next;
++   dev_t dev;
++   ino_t ino;
++   struct nvkmd_nvrm_mem *mem;
++};
++static struct nvrm_export_entry *nvrm_exports;
++static pthread_mutex_t nvrm_exports_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++nvrm_exports_forget(struct nvkmd_nvrm_mem *mem)
++{
++   pthread_mutex_lock(&nvrm_exports_lock);
++   struct nvrm_export_entry **link = &nvrm_exports;
++   while (*link) {
++      struct nvrm_export_entry *e = *link;
++      if (e->mem == mem) {
++         *link = e->next;
++         free(e);
++      } else {
++         link = &e->next;
++      }
++   }
++   pthread_mutex_unlock(&nvrm_exports_lock);
++}
+ 
+ static VkResult
+ create_mem_or_close_bo(struct nvkmd_nvrm_dev *dev,
+@@ -153,7 +193,25 @@ nvkmd_nvrm_import_dma_buf(struct nvkmd_dev *_dev,
+                              struct vk_object_base *log_obj,
+                              int fd, struct nvkmd_mem **mem_out)
+ {
+-   return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "nvkmd_nvrm_import_dma_buf: not implemented");
++   struct stat st;
++   if (fstat(fd, &st) != 0)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "nvkmd_nvrm_import_dma_buf: bad file descriptor");
++
++   struct nvkmd_mem *found = NULL;
++   pthread_mutex_lock(&nvrm_exports_lock);
++   for (struct nvrm_export_entry *e = nvrm_exports; e != NULL; e = e->next) {
++      if (e->dev == st.st_dev && e->ino == st.st_ino) {
++         found = nvkmd_mem_ref(&e->mem->base);
++         break;
++      }
++   }
++   pthread_mutex_unlock(&nvrm_exports_lock);
++
++   if (found == NULL)
++      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "nvkmd_nvrm_import_dma_buf: not a descriptor exported by this process");
++
++   *mem_out = found;
++   return VK_SUCCESS;
+ }
+ 
+ static void
+@@ -166,6 +224,7 @@ nvkmd_nvrm_mem_free(struct nvkmd_mem *_mem)
+    struct NvRmApi rm;
+    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+ 
++   nvrm_exports_forget(mem);
+    nvkmd_va_free(mem->base.va);
+    nvRmApiFree(&rm, mem->hMemoryPhys);
+    FREE(mem);
+@@ -253,7 +312,31 @@ nvkmd_nvrm_mem_export_dma_buf(struct nvkmd_mem *_mem,
+ {
+    struct nvkmd_nvrm_mem *mem = nvkmd_nvrm_mem(_mem);
+ 
+-   return VK_ERROR_UNKNOWN;
++   char path[] = "/tmp/nvk-export-XXXXXX";
++   int fd = mkstemp(path);
++   if (fd < 0)
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   unlink(path);
++   fcntl(fd, F_SETFD, FD_CLOEXEC);
++
++   struct stat st;
++   struct nvrm_export_entry *e = malloc(sizeof(*e));
++   if (e == NULL || fstat(fd, &st) != 0) {
++      free(e);
++      close(fd);
++      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++   e->dev = st.st_dev;
++   e->ino = st.st_ino;
++   e->mem = mem;
++
++   pthread_mutex_lock(&nvrm_exports_lock);
++   e->next = nvrm_exports;
++   nvrm_exports = e;
++   pthread_mutex_unlock(&nvrm_exports_lock);
++
++   *fd_out = fd;
++   return VK_SUCCESS;
+ }
+ 
+ static uint32_t
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 index b4b032c7..f8a899a4 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
