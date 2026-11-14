@@ -350,9 +350,21 @@ void NvAccelerant::RetraceLoop()
 	bigtime_t firstTime = system_time();
 	bool reported = false;
 
+	// The counter is polled, but not all the time: after a vblank the thread sleeps for most of a frame (the length of the
+	// last one) and only polls closely near the next. Polling every 250 us all the time kept a CPU thread busy.
+	bigtime_t lastChange = system_time();
+	bigtime_t period = 16667;
+	bigtime_t pollGap = 500;
+
 	while (!fRetraceStop) {
 		NvU64 count = data->head[fHead].vblankCount;
 		if (count != last) {
+			const bigtime_t now = system_time();
+			const bigtime_t gap = (now - lastChange) / (bigtime_t)(count - last);
+			// (a frame between 2 ms and 50 ms: anything else is a pause in the display, not a refresh rate)
+			if (gap >= 2000 && gap <= 50000)
+				period = gap;
+			lastChange = now;
 			last = count;
 			int32 waiting = 0;
 			if (get_sem_count(fRetraceSem, &waiting) == B_OK && waiting < 1) {
@@ -371,7 +383,16 @@ void NvAccelerant::RetraceLoop()
 				reported = true;
 			}
 		}
-		snooze(250);
+		const bigtime_t sinceChange = system_time() - lastChange;
+		if (sinceChange < period * 3 / 4) {
+			// far from the next vblank: sleep until it is close
+			snooze(period * 3 / 4 - sinceChange);
+		} else if (sinceChange > period * 4) {
+			// no vblank for a while (the display is off): look rarely
+			snooze(5000);
+		} else {
+			snooze(pollGap);
+		}
 	}
 }
 
