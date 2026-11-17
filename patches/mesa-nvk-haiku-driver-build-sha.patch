@@ -1,0 +1,48 @@
+--- a/src/nouveau/vulkan/nvk_instance.c	2026-11-17 08:14:56.942394165 -0500
++++ b/src/nouveau/vulkan/nvk_instance.c	2026-11-17 08:20:55.636650977 -0500
+@@ -15,6 +15,12 @@
+ #include "util/mesa-sha1.h"
+ #include "util/u_debug.h"
+ 
++#ifdef __HAIKU__
++#include <dlfcn.h>
++#include <string.h>
++#include <sys/stat.h>
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
+ {
+@@ -181,6 +187,32 @@
+ 
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == SHA1_DIGEST_LENGTH);
+    memcpy(instance->driver_build_sha, build_id_data(note), SHA1_DIGEST_LENGTH);
++#else
++   /* Haiku has no ELF build-id here, and driver_build_sha used to be left unset: it held whatever the allocator had in that
++    * memory, so it differed from one process to the next. It names the shader cache directory and is part of the
++    * pipelineCacheUUID, so no process ever found the cache of an earlier one (every start-up compiled every shader again).
++    * Derive it from the driver file instead (path, size and modification time): the same for every process, and a new
++    * value when the driver is replaced. */
++   {
++      struct mesa_sha1 sha_ctx;
++      _mesa_sha1_init(&sha_ctx);
++
++      Dl_info dl_info;
++      struct stat st;
++      if (dladdr((void *)nvk_CreateInstance, &dl_info) && dl_info.dli_fname &&
++          stat(dl_info.dli_fname, &st) == 0) {
++         _mesa_sha1_update(&sha_ctx, dl_info.dli_fname, strlen(dl_info.dli_fname));
++         const uint64_t size = (uint64_t)st.st_size;
++         const uint64_t mtime = (uint64_t)st.st_mtime;
++         _mesa_sha1_update(&sha_ctx, &size, sizeof(size));
++         _mesa_sha1_update(&sha_ctx, &mtime, sizeof(mtime));
++      } else {
++         /* no file to look at: at least the version and the date of this build */
++         static const char fallback[] = PACKAGE_VERSION __DATE__ __TIME__;
++         _mesa_sha1_update(&sha_ctx, fallback, sizeof(fallback));
++      }
++      _mesa_sha1_final(&sha_ctx, instance->driver_build_sha);
++   }
+ #endif
+ 
+    *pInstance = nvk_instance_to_handle(instance);
