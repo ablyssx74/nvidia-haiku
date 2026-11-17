@@ -86,7 +86,7 @@ index dd7ee5f7..52332605 100644
  }
  
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-index bc1c5259..9d2185ea 100644
+index bc1c5259..054f6bd8 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 @@ -5,6 +5,7 @@
@@ -97,17 +97,18 @@ index bc1c5259..9d2185ea 100644
  #include "nvkmd/nvkmd.h"
  #include "util/vma.h"
  #include "vk_sync.h"
-@@ -108,6 +109,9 @@ VkResult nvkmd_nvrm_alloc_va(struct nvkmd_dev *dev,
+@@ -108,6 +109,10 @@ VkResult nvkmd_nvrm_alloc_va(struct nvkmd_dev *dev,
                                  uint64_t size_B, uint64_t align_B,
                                  uint64_t fixed_addr, struct nvkmd_va **va_out);
  
 +/* print the recorded GPU address range events (nvkmd_nvrm_va.c) */
 +void nvkmd_nvrm_dump_va_events(void);
++void nvkmd_nvrm_dump_va_events_for(uint64_t addr, uint64_t len);
 +
  struct nvkmd_nvrm_exec_ctx {
     struct nvkmd_ctx base;
     struct nvkmd_mem *notifier;
-@@ -126,7 +130,9 @@ struct nvkmd_nvrm_exec_ctx {
+@@ -126,7 +131,9 @@ struct nvkmd_nvrm_exec_ctx {
     } subchannels;
     int osEvent;
     NvHandle hEvent;
@@ -118,7 +119,7 @@ index bc1c5259..9d2185ea 100644
     uint64_t gpPut;
     struct nv_push push;
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-index ffc3c34e..3ab86c5a 100644
+index ffc3c34e..102cf08f 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 @@ -12,6 +12,9 @@
@@ -131,7 +132,37 @@ index ffc3c34e..3ab86c5a 100644
  #include "nv_push_clc36f.h"
  
  #include "class/cl0002.h" // NV01_CONTEXT_DMA
-@@ -100,6 +103,7 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
+@@ -23,6 +26,29 @@
+ #include "class/cl0005.h" // NV01_EVENT
+ #include "ctrl/ctrla06f/ctrla06fgpfifo.h" // NVA06F_CTRL_CMD_BIND
+ #include "ctrl/ctrlc36f.h" // NVC36F_CTRL_CMD_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN
++#include <time.h>
++#include <pthread.h>
++
++/* NVK_NVRM_TRACE=1: one line on stderr (time of day in ms, thread, context) for every flush, every second of a wait and every destroy, with the
++ * channel's GPGet/GPPut and the semaphore. Meant to show what happened to a channel that stops fetching work (the Firefox shutdown hang). Off by default. */
++static bool
++nvrm_trace_on(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = getenv("NVK_NVRM_TRACE") != NULL;
++   return on;
++}
++
++#define NVRM_TRACE(ctx, ...) do { \
++   if (nvrm_trace_on()) { \
++      struct timespec _ts; clock_gettime(CLOCK_REALTIME, &_ts); \
++      fprintf(stderr, "NVK nvrm trace %02d:%02d:%02d.%03d thr %p ctx %p: ", (int)(_ts.tv_sec / 3600 % 24), (int)(_ts.tv_sec / 60 % 60), \
++              (int)(_ts.tv_sec % 60), (int)(_ts.tv_nsec / 1000000), (void *)pthread_self(), (void *)(ctx)); \
++      fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); \
++   } \
++} while (0)
++
+ 
+ #define SUBC_NVC36F 0
+ 
+@@ -100,6 +126,7 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
     ctx->base.ops = &nvkmd_nvrm_exec_ctx_ops;
     ctx->base.dev = &dev->base;
  
@@ -139,7 +170,25 @@ index ffc3c34e..3ab86c5a 100644
     ctx->osEvent = -1;
  
     VK_CHECK(nvkmd_dev_alloc_mapped_mem(_dev, log_obj,  0x1000,  0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,  &ctx->notifier));
-@@ -225,6 +229,7 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+@@ -204,6 +231,7 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+    struct NvRmApi rm;
+    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
+ 
++   NVRM_TRACE(ctx, "destroy begin (lost %d)", (int)ctx->lost);
+    nvRmApiFree(&rm, ctx->hEvent);
+    if (ctx->osEvent >= 0)
+       close(ctx->osEvent);
+@@ -212,7 +240,9 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
+    nvRmApiFree(&rm, ctx->subchannels.hEng3d);
+    nvRmApiFree(&rm, ctx->subchannels.hM2mf);
+    nvRmApiFree(&rm, ctx->subchannels.hCompute);
++   NVRM_TRACE(ctx, "destroy: freeing the channel");
+    nvRmApiFree(&rm, ctx->hChannel);
++   NVRM_TRACE(ctx, "destroy: channel freed");
+    nvRmApiFree(&rm, ctx->hCtxDma);
+    if (ctx->sem != NULL)
+       nvkmd_mem_unref(ctx->sem);
+@@ -225,6 +255,7 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
     if (ctx->notifier != NULL)
        nvkmd_mem_unref(ctx->notifier);
  
@@ -147,7 +196,7 @@ index ffc3c34e..3ab86c5a 100644
     FREE(ctx);
  }
  
-@@ -239,8 +244,73 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
+@@ -239,8 +270,73 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
     return VK_SUCCESS;
  }
  
@@ -222,7 +271,7 @@ index ffc3c34e..3ab86c5a 100644
                               struct vk_object_base *log_obj)
  {
     struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
-@@ -249,7 +319,11 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+@@ -249,13 +345,19 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
     struct NvRmApi rm;
     nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
@@ -234,9 +283,41 @@ index ffc3c34e..3ab86c5a 100644
     NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
     KeplerBControlGPFifo *userD = ctx->userD->map;
     uint64_t *semAdr = (uint64_t*)ctx->sem->map;
-@@ -271,10 +345,29 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    uint64_t semAdrGpu = ctx->sem->va->addr;
+ 
+    ctx->wSeq++;
++   NVRM_TRACE(ctx, "flush begin seq %" PRIu64 " GPGet %u GPPut(ours) %u sem %" PRIu64 " pushdw %u", ctx->wSeq,
++              (unsigned)userD->GPGet, (unsigned)ctx->gpPut, *semAdr, (unsigned)nv_push_dw_count(&ctx->push));
+ 
+    write_semaphore_release(&ctx->push, semAdrGpu, ctx->wSeq, true);
+ 
+@@ -269,12 +371,64 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+    userD->GPPut = ctx->gpPut;
+ 
     volatile NvU32 *doorbell = (void*)((NvU8*)pdev->usermodeMap.address + NVC361_NOTIFY_CHANNEL_PENDING);
-    *doorbell = submitTokenNotifier->info32;
+-   *doorbell = submitTokenNotifier->info32;
++   /* NVK_NVRM_TEST_WEDGE=N (test only): on flush number N of a context, do not ring the doorbell, so the GPU never fetches the entries just
++    * queued: the same "GPGet short of GPPut, nothing moves" state a wedged Firefox channel is in. Used to see what the machine does when a
++    * process with such a channel ends. */
++   static int wedge_at = -2;
++   if (wedge_at == -2) {
++      const char *e = getenv("NVK_NVRM_TEST_WEDGE");
++      wedge_at = e ? atoi(e) : -1;
++   }
++   if (wedge_at > 0 && ctx->wSeq == (uint64_t)wedge_at) {
++      NVRM_TRACE(ctx, "TEST WEDGE: not ringing the doorbell for seq %" PRIu64, ctx->wSeq);
++   } else {
++      *doorbell = submitTokenNotifier->info32;
++   }
++   NVRM_TRACE(ctx, "doorbell seq %" PRIu64 " token %u GPPut %u", ctx->wSeq, (unsigned)submitTokenNotifier->info32, (unsigned)ctx->gpPut);
++   if (nvrm_trace_on()) {
++      /* the GP entries the GPU still has to fetch (raw words: address bits, length, flags), up to 8 */
++      const uint32_t *gpring = (const uint32_t *)ctx->gpFifo->map;
++      for (uint32_t k = 0, g = (uint32_t)userD->GPGet; k < 8 && (g + k) % 0x8000 != ctx->gpPut % 0x8000; k++) {
++         const uint32_t idx = (g + k) % 0x8000;
++         NVRM_TRACE(ctx, "  pending GP entry %u: %08x %08x", idx, gpring[2 * idx], gpring[2 * idx + 1]);
++      }
++   }
  
 +   const uint64_t start_ns = os_time_get_nano();
 +   const uint64_t timeout_ns = nvrm_gpu_timeout_ns();
@@ -259,12 +340,40 @@ index ffc3c34e..3ab86c5a 100644
 +                 (unsigned)errNotifier->info16, (unsigned)errNotifier->status);
 +         if (chanError != 0)
 +            nvrm_dump_fault_pushbuffer(ctx, log_obj, ((uint64_t)userD->GetHi << 32) | userD->Get);
++         else if (nvrm_trace_on()) {
++            /* a timeout without a channel error: say what happened to the memory the pending GP entries point at */
++            const uint32_t *gpring = (const uint32_t *)ctx->gpFifo->map;
++            for (uint32_t k = 0, g = (uint32_t)userD->GPGet; k < 8 && (g + k) % 0x8000 != ctx->gpPut % 0x8000; k++) {
++               const uint32_t idx = (g + k) % 0x8000;
++               const uint32_t e0 = gpring[2 * idx], e1 = gpring[2 * idx + 1];
++               const uint64_t a = ((uint64_t)(e1 & 0xff) << 32) | (e0 & ~3u);
++               const uint64_t l = (uint64_t)((e1 >> 10) & 0x1fffff) * 4;
++               fprintf(stderr, "NVK nvrm: pending GP entry %u: address %#" PRIx64 " length %" PRIu64 " bytes (words %08x %08x)\n", idx, a, l, e0, e1);
++               nvkmd_nvrm_dump_va_events_for(a, l);
++            }
++         }
 +         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST, "GPU channel %s (error %u %s)",
 +                          chanError != 0 ? "failed" : "timed out", (unsigned)chanError, nvrm_channel_error_name(chanError));
        }
  		struct pollfd pollFds[1] = {
  			{
-@@ -297,6 +390,22 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+@@ -283,6 +437,8 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+ 			}
+ 		};
+ 		poll(pollFds, 1, 1000);
++		NVRM_TRACE(ctx, "waiting seq %" PRIu64 " sem %" PRIu64 " GPGet %u GPPut %u errStatus %#x", ctx->wSeq, *semAdr,
++		           (unsigned)userD->GPGet, (unsigned)userD->GPPut, (unsigned)errNotifier->status);
+ #if 0
+ 		printf("poll\n");
+       fprintf(stderr, "rSeq: %#" PRIx64 "\n", rSeq);
+@@ -291,12 +447,29 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+ #endif
+    }
+ 
++   NVRM_TRACE(ctx, "flush done seq %" PRIu64 " GPGet %u", ctx->wSeq, (unsigned)userD->GPGet);
+    ctx->gpGet = ctx->gpPut;
+    nv_push_init(&ctx->push, ctx->cmdBuf->map, 0x10000 / 4, BITFIELD_BIT(SUBC_NV9097));
+ 
     return VK_SUCCESS;
  }
  
@@ -287,7 +396,7 @@ index ffc3c34e..3ab86c5a 100644
  static VkResult
  nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
                              struct vk_object_base *log_obj,
-@@ -305,9 +414,11 @@ nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
+@@ -305,9 +478,11 @@ nvkmd_nvrm_exec_ctx_exec(struct nvkmd_ctx *_ctx,
  {
     struct nvkmd_nvrm_exec_ctx *ctx = nvkmd_nvrm_exec_ctx(_ctx);
  
@@ -419,7 +528,7 @@ index 9af48be4..af096056 100644
  
  static uint32_t
 diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
-index b4b032c7..f8a899a4 100644
+index b4b032c7..26d7a1f4 100644
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
 @@ -4,6 +4,12 @@
@@ -435,7 +544,7 @@ index b4b032c7..f8a899a4 100644
  
  #include "util/bitscan.h"
  #include "util/u_memory.h"
-@@ -15,6 +21,95 @@
+@@ -15,6 +21,117 @@
  #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
  
  
@@ -511,6 +620,28 @@ index b4b032c7..f8a899a4 100644
 +   e->handle = handle;
 +}
 +
++/* The events that touched [addr, addr + len): what happened to the memory a stuck GP entry points at (printed on a channel timeout). */
++void
++nvkmd_nvrm_dump_va_events_for(uint64_t addr, uint64_t len)
++{
++   static const char *names[] = {"?", "ALLOC", "FREE", "BIND", "UNBIND"};
++   const uint32_t next = p_atomic_read(&nvrm_va_event_next);
++   const uint32_t count = next < NVRM_VA_EVENTS ? next : NVRM_VA_EVENTS;
++   uint32_t hits = 0;
++   fprintf(stderr, "NVK nvrm: va events touching %#" PRIx64 " +%#" PRIx64 " (of %u recorded, oldest first):\n", addr, len, count);
++   for (uint32_t k = 0; k < count; k++) {
++      const uint32_t i = next - count + k;
++      const struct nvrm_va_event *e = &nvrm_va_events[i % NVRM_VA_EVENTS];
++      if (e->addr + e->size <= addr || e->addr >= addr + (len ? len : 1))
++         continue;
++      hits++;
++      fprintf(stderr, "NVK nvrm:   va #%u t=%.6f tid=%x %s %#" PRIx64 " +%#" PRIx64 " flags=%x handle=%#x\n", i, e->t_ns / 1e9, e->tid,
++              names[e->what < 5 ? e->what : 0], e->addr, e->size, e->flags, e->handle);
++   }
++   fprintf(stderr, "NVK nvrm:   %u events touched it\n", hits);
++   fflush(stderr);
++}
++
 +void
 +nvkmd_nvrm_dump_va_events(void)
 +{
@@ -531,7 +662,7 @@ index b4b032c7..f8a899a4 100644
  VkResult
  nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
                         struct vk_object_base *log_obj,
-@@ -59,6 +154,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+@@ -59,6 +176,11 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
  		.alignment = align_B,
  		.hVASpace = pdev->hVaSpace,
  	};
@@ -543,7 +674,7 @@ index b4b032c7..f8a899a4 100644
  	switch (pte_kind) {
  		case 0x1:
  			params.type = NVOS32_TYPE_DEPTH;
-@@ -121,6 +221,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
+@@ -121,6 +243,7 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
     }
     va->hMemoryVirt = hMemoryVirt;
     va->base.addr = params.offset;
@@ -551,7 +682,7 @@ index b4b032c7..f8a899a4 100644
  
     *va_out = &va->base;
  
-@@ -137,6 +238,7 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
+@@ -137,6 +260,7 @@ nvkmd_nvrm_va_free(struct nvkmd_va *_va)
     struct NvRmApi rm;
     nvkmd_nvrm_dev_api_ctl(pdev, &rm);
  
@@ -559,7 +690,7 @@ index b4b032c7..f8a899a4 100644
     nvRmApiFree(&rm, va->hMemoryVirt);
  
     FREE(va);
-@@ -173,6 +275,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
+@@ -173,6 +297,7 @@ nvkmd_nvrm_va_bind_mem(struct nvkmd_va *_va,
     }
  
     va->hMemoryPhys = mem->hMemoryPhys;
@@ -567,7 +698,7 @@ index b4b032c7..f8a899a4 100644
  
     return VK_SUCCESS;
  }
-@@ -194,6 +297,7 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
+@@ -194,6 +319,7 @@ nvkmd_nvrm_va_unbind(struct nvkmd_va *_va,
     if (nvRes != NV_OK)
        return VK_ERROR_UNKNOWN;
  
